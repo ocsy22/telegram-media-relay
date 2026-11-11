@@ -498,6 +498,20 @@ async def telegram_login(action, fields):
 def manage_profile(fields):
     global LOGIN_FLOW
     action = fields.get("action", "")
+    if action == "delete":
+        selected = fields.get("profile", "")
+        if not re.fullmatch(r"[1-9][0-9]{0,17}", selected):
+            raise ValueError("请选择要删除的连接。")
+        with LOCK:
+            if WORKER and WORKER.is_alive():
+                raise ValueError("请先停止当前任务并等待退出。")
+            with database() as conn:
+                cursor = conn.execute("DELETE FROM profiles WHERE id=?", (int(selected),))
+                if not cursor.rowcount:
+                    raise ValueError("该连接已删除或不存在。")
+                conn.execute("""UPDATE config SET data=json_set(data, '$.profile', '', '$.auto_live', 0)
+                                WHERE id=1 AND json_extract(data, '$.profile')=?""", (selected,))
+        return "已删除连接。"
     if action == "add_bot":
         name = fields.get("name", "").strip()
         token = fields.get("token", "").strip()
@@ -626,8 +640,14 @@ class Admin(BaseHTTPRequestHandler):
             for i, name, backend in choices
         )
         profile_list = "".join(
-            f'<li>{html.escape(name)} · {"Bot" if backend == "bot" else "Telegram 账号"}</li>'
-            for _, name, backend in choices
+            f'<li>{html.escape(name)} · {"Bot" if backend == "bot" else "Telegram 账号"}'
+            + (f'<form class="delete-profile" method="post" action="/accounts">'
+               f'<input type="hidden" name="csrf" value="{CSRF}">'
+               f'<input type="hidden" name="profile" value="{i}">'
+               '<button class="secondary" name="action" value="delete">删除</button></form>'
+               if i != "legacy" else ' · 终端导入')
+            + '</li>'
+            for i, name, backend in choices
         )
         flow = LOGIN_FLOW
         step = flow["step"] if flow and flow["expires"] > time.monotonic() else ""
@@ -657,6 +677,7 @@ class Admin(BaseHTTPRequestHandler):
         .row,.actions{{display:flex;gap:8px;flex-wrap:wrap}}.row label{{flex:1}}button,a{{font:inherit}}
         button{{cursor:pointer;background:#155c9e;color:white;border:0;border-radius:7px;padding:8px 12px}}
         .secondary{{background:#e6eef6;color:#193d61}}ol{{padding-left:22px;max-height:580px;overflow:auto}}
+        .delete-profile{{display:inline-block;margin-left:12px}}
         li{{padding:9px 0;border-bottom:1px solid #e5edf3;overflow-wrap:anywhere}}time{{color:#52667b;display:block;font-size:12px}}
         .notice{{grid-column:1/-1;margin:0;padding:10px;background:#dcecff;border-radius:7px}}
         progress{{width:100%;height:12px}} #progress-label{{color:#304961}}
@@ -699,6 +720,11 @@ class Admin(BaseHTTPRequestHandler):
         <h2 style="margin-top:24px">已配置的连接</h2><ul>{profile_list or '<li>暂无</li>'}</ul></section>
         </main></div></div><script nonce="{nonce}">
         const get = id => document.getElementById(id);
+        for (const form of document.querySelectorAll(".delete-profile")) {{
+            form.addEventListener("submit", event => {{
+                if (!confirm("确定删除此连接？")) event.preventDefault();
+            }});
+        }}
         let newest = null;
         async function refresh() {{
             try {{
@@ -806,3 +832,4 @@ if __name__ == "__main__":
             WORKER = threading.Thread(target=run, args=(saved, "live", None, None), daemon=True)
             WORKER.start()
     server.serve_forever()
+
