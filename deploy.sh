@@ -15,9 +15,10 @@ if [[ ! "$address" =~ ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$ ]]; then
   exit 1
 fi
 
-if ! command -v python3 >/dev/null || ! command -v curl >/dev/null; then
+if ! command -v python3 >/dev/null || ! command -v curl >/dev/null ||
+   ! python3 -c 'import ensurepip' 2>/dev/null; then
   apt-get update
-  apt-get install -y ca-certificates curl python3
+  apt-get install -y ca-certificates curl python3 python3-venv
 fi
 
 work=$(mktemp -d)
@@ -51,7 +52,13 @@ if [[ ! -f "$config" || "${2:-}" == --configure-admin ]]; then
 fi
 
 install -d -m 0755 /opt/telegram-media-relay
+python3 -m venv /opt/telegram-media-relay/venv
+/opt/telegram-media-relay/venv/bin/python -m pip install --disable-pip-version-check 'Telethon==1.43.0'
 install -m 0644 "$work/app.py" /opt/telegram-media-relay/app.py
+account=/etc/telegram-media-relay/telegram-account.json
+if [[ ! -e "$account" ]]; then
+  install -m 0600 /dev/null "$account"
+fi
 cat > /etc/systemd/system/telegram-media-relay.service <<'UNIT'
 [Unit]
 Description=Telegram Media Relay
@@ -63,10 +70,11 @@ DynamicUser=yes
 StateDirectory=telegram-media-relay
 StateDirectoryMode=0700
 EnvironmentFile=/etc/telegram-media-relay/service.env
+LoadCredential=telegram-account.json:/etc/telegram-media-relay/telegram-account.json
 Environment=DB_PATH=/var/lib/telegram-media-relay/relay.sqlite3
 Environment=BIND_HOST=0.0.0.0
 Environment=PORT=8766
-ExecStart=/usr/bin/python3 /opt/telegram-media-relay/app.py
+ExecStart=/opt/telegram-media-relay/venv/bin/python /opt/telegram-media-relay/app.py
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=yes

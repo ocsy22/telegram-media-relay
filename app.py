@@ -1,4 +1,6 @@
+import asyncio
 import base64
+import getpass
 import hmac
 import html
 import json
@@ -6,10 +8,12 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs
 from urllib.request import Request, urlopen
@@ -19,6 +23,7 @@ CSRF = secrets.token_urlsafe(32)
 TOKEN = re.compile(r"[1-9][0-9]{4,15}:[A-Za-z0-9_-]{20,100}")
 CHAT = re.compile(r"(?:-100[0-9]{5,13}|@[A-Za-z0-9_]{5,32})")
 STATE = {"status": "已停止", "identity": ""}
+PROGRESS = {"processed": 0, "total": None, "sent": 0}
 LOCK = threading.Lock()
 STOP = threading.Event()
 WORKER = None
@@ -55,6 +60,147 @@ def log(detail):
     with database() as conn:
         conn.execute("INSERT INTO events(at, detail) VALUES(datetime('now'), ?)", (detail,))
         conn.execute("DELETE FROM events WHERE id <= (SELECT max(id)-300 FROM events)")
+
+
+def account_file():
+    directory = os.getenv("CREDENTIALS_DIRECTORY", "/etc/telegram-media-relay")
+    return Path(directory) / "telegram-account.json"
+
+
+def account_login():
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    async def login():
+        api_id = int(input("Telegram API ID: ").strip())
+        api_hash = getpass.getpass("Telegram API Hash: ").strip()
+        if api_id <= 0 or not re.fullmatch(r"[a-fA-F0-9]{32}", api_hash):
+            raise ValueError("API ID 或 API Hash 无效")
+        client = TelegramClient(StringSession(), api_id, api_hash)
+        try:
+            await client.start(code_callback=lambda: getpass.getpass("Telegram 登录验证码: "))
+            user = await client.get_me()
+            if user.bot:
+                raise ValueError("请输入 Telegram 个人账号手机号")
+            path = account_file()
+            temp = path.with_suffix(".tmp")
+            temp.write_text(json.dumps({"id": api_id, "hash": api_hash, "session": client.session.save()}))
+            os.replace(temp, path)
+            print("账号已登录，请重启转发服务。")
+        finally:
+            await client.disconnect()
+
+    asyncio.run(login())
+
+
+async def account_run(settings, action, start, end):
+    from telethon import TelegramClient, events, errors
+    from telethon.sessions import StringSession
+    from telethon.tl.types import Channel
+
+    credential = account_file().read_text()
+    if not credential:
+        raise ValueError("账号尚未登录，请按部署说明在服务器终端登录。")
+    account = json.loads(credential)
+    client = TelegramClient(StringSession(account["session"]), account["id"], account["hash"],
+                            flood_sleep_threshold=0, request_retries=1)
+    await client.connect()
+    try:
+        user = await client.get_me()
+        if not user:
+            raise ValueError("账号会话已失效，请重新登录。")
+        STATE["identity"] = "@" + user.username if user.username else str(user.id)
+        # Load dialogs so numeric IDs can resolve private channels and their access hashes.
+        await client.get_dialogs()
+        source_id = settings["source"]
+        source = await client.get_entity(int(source_id) if source_id.startswith("-") else source_id)
+        targets = {}
+        for item in settings["targets"]:
+            entity = await client.get_entity(int(item) if item.startswith("-") else item)
+            if not isinstance(entity, Channel) or not entity.broadcast or entity.id == source.id:
+                raise ValueError("目标必须是其他频道。")
+            if not entity.creator and not getattr(entity.admin_rights, "post_messages", False):
+                raise ValueError(f"目标 {item} 未授予账号发帖权限。")
+            targets[entity.id] = entity
+        if not isinstance(source, Channel) or not source.broadcast:
+            raise ValueError("来源必须是频道。")
+        if action == "test":
+            log(f"账号连接验证通过 · {len(targets)} 个目标")
+            return
+        sending = asyncio.Lock()
+
+        async def deliver(messages):
+            async with sending:
+                if STOP.is_set():
+                    return
+                allowed = [msg for msg in messages if not msg.noforwards and not msg.action]
+                if source.noforwards:
+                    allowed = []
+                if len(allowed) != len(messages):
+                    log(f"跳过 {len(messages)-len(allowed)} 条受保护或服务消息")
+                for target in targets.values():
+                    if not allowed:
+                        break
+                    while not STOP.is_set():
+                        try:
+                            copy = action == "history" or settings["mode"] == "copy"
+                            result = await client.forward_messages(
+                                target, allowed, from_peer=source, drop_author=copy,
+                                drop_media_captions=copy and settings.get("remove_caption", False))
+                            count = sum(item is not None for item in result)
+                            PROGRESS["sent"] += count
+                            log(f"目标 {target.id} 已发送 {count}/{len(allowed)} 条")
+                            break
+                        except errors.FloodWaitError as exc:
+                            log(f"目标 {target.id} 限流，等待 {exc.seconds} 秒")
+                            for _ in range(exc.seconds):
+                                if STOP.is_set():
+                                    break
+                                await asyncio.sleep(1)
+                        except errors.RPCError as exc:
+                            log(f"目标 {target.id} 发送失败 · {type(exc).__name__}")
+                            break
+                if end is None:
+                    PROGRESS["processed"] += len(messages)
+
+        if action == "live":
+            async def album(event):
+                await deliver(sorted(event.messages, key=lambda msg: msg.id))
+
+            async def single(event):
+                if not event.message.grouped_id:
+                    await deliver([event.message])
+
+            client.add_event_handler(album, events.Album(chats=source))
+            client.add_event_handler(single, events.NewMessage(chats=source))
+            STATE["status"] = "账号实时转发中"
+            log("账号实时监听已连接")
+            while not STOP.is_set() and client.is_connected():
+                await asyncio.sleep(0.5)
+            if not STOP.is_set():
+                raise ValueError("账号连接已断开，请重新启动实时任务。")
+        else:
+            STATE["status"] = "账号历史迁移中"
+            group = []
+            async for message in client.iter_messages(source, reverse=True, min_id=start-1,
+                                                      max_id=end+1 if end else 0):
+                if STOP.is_set():
+                    break
+                if group and (not message.grouped_id or group[0].grouped_id != message.grouped_id):
+                    await deliver(group)
+                    group = []
+                group.append(message)
+                if not message.grouped_id:
+                    await deliver(group)
+                    group = []
+                if end:
+                    PROGRESS["processed"] = message.id - start + 1
+            if group and not STOP.is_set():
+                await deliver(group)
+            if end and not STOP.is_set():
+                PROGRESS["processed"] = end - start + 1
+    finally:
+        await client.disconnect()
 
 
 def config():
@@ -182,6 +328,7 @@ def flush(settings, bot, source, targets):
                 conn.execute("INSERT OR IGNORE INTO delivered VALUES (?, ?, ?, ?)",
                              (bot, source, album, target))
             log(f"目标 {target} 已发送 {count}/{len(ids)} 条")
+            PROGRESS["sent"] += count
         if failed:
             with database() as conn:
                 conn.execute("UPDATE pending SET ready=? WHERE bot=? AND source=? AND album=?",
@@ -190,6 +337,7 @@ def flush(settings, bot, source, targets):
         with database() as conn:
             conn.execute("DELETE FROM pending WHERE bot=? AND source=? AND album=?", (bot, source, album))
             conn.execute("DELETE FROM delivered WHERE bot=? AND source=? AND album=?", (bot, source, album))
+        PROGRESS["processed"] += len(ids)
 
 
 def live(settings, bot, source, targets):
@@ -231,6 +379,7 @@ def migrate(settings, source, targets, start, end):
             delivered += count
             log(f"历史 {first}–{last} → {target} · 复制 {count} 条，跳过 {len(ids)-count} 条")
         copied += delivered
+        PROGRESS.update(processed=last-start+1, sent=copied)
         STATE["status"] = f"历史迁移已扫描至 {last} · 共复制 {copied} 条"
         empty = 0 if delivered else empty + 1
         if end is None and empty >= 3:
@@ -242,21 +391,24 @@ def migrate(settings, source, targets, start, end):
 
 def run(settings, action, start, end):
     try:
-        identity, source, targets = inspect(settings, action == "live")
-        STATE["identity"] = "@" + identity["username"]
-        if action == "live":
-            log("实时转发已启动")
-            live(settings, identity["id"], source, targets)
+        if settings.get("backend") == "account":
+            asyncio.run(account_run(settings, action, start, end))
         else:
-            log(f"历史迁移已启动 · 从 {start} 开始")
-            migrate(settings, source, targets, start, end)
+            identity, source, targets = inspect(settings, action == "live")
+            STATE["identity"] = "@" + identity["username"]
+            if action == "live":
+                log("实时转发已启动")
+                live(settings, identity["id"], source, targets)
+            else:
+                log(f"历史迁移已启动 · 从 {start} 开始")
+                migrate(settings, source, targets, start, end)
         STATE["status"] = "已停止" if STOP.is_set() else "已完成"
     except (TelegramError, ValueError) as exc:
         STATE["status"] = "任务失败"
         log(str(exc))
-    except Exception:
+    except Exception as exc:
         STATE["status"] = "任务失败"
-        log("内部错误，请检查服务状态和数据库权限。")
+        log(f"任务异常 · {type(exc).__name__}")
 
 
 def fields_to_settings(fields):
@@ -264,13 +416,16 @@ def fields_to_settings(fields):
     source = fields.get("source", "").strip()
     targets = list(dict.fromkeys(re.split(r"[,，\s]+", fields.get("targets", "").strip())))
     mode = fields.get("mode", "")
-    if not TOKEN.fullmatch(token):
+    backend = fields.get("backend", "bot")
+    if backend not in {"bot", "account"}:
+        raise ValueError("请选择连接方式。")
+    if backend == "bot" and not TOKEN.fullmatch(token):
         raise ValueError("请填写有效的 Bot Token。")
     if not CHAT.fullmatch(source) or not 1 <= len(targets) <= 20 or any(not CHAT.fullmatch(x) for x in targets):
         raise ValueError("请填写频道 @用户名或 -100 开头的数字 ID，最多 20 个目标。")
     if mode not in {"copy", "forward"}:
         raise ValueError("请选择转发方式。")
-    return {"token": token, "source": source, "targets": targets, "mode": mode,
+    return {"token": token, "source": source, "targets": targets, "mode": mode, "backend": backend,
             "remove_caption": fields.get("remove_caption") == "on"}
 
 
@@ -289,6 +444,12 @@ def control(fields):
             raise ValueError("请先停止当前任务并等待退出。")
         settings = fields_to_settings(fields)
         if action == "test":
+            if settings["backend"] == "account":
+                STOP.clear()
+                STATE["status"] = "正在检查账号权限"
+                WORKER = threading.Thread(target=run, args=(settings, action, None, None), daemon=True)
+                WORKER.start()
+                return "账号测试已提交，请查看运行日志。"
             identity, _, targets = inspect(settings)
             STATE["identity"] = "@" + identity["username"]
             return f"连接验证通过 · {STATE['identity']} · {len(targets)} 个目标频道"
@@ -312,6 +473,7 @@ def control(fields):
         if action == "save":
             return "已保存配置。"
         STOP.clear()
+        PROGRESS.update(processed=0, sent=0, total=end-start+1 if end is not None else None)
         STATE["status"] = "正在检查频道权限"
         WORKER = threading.Thread(target=run, args=(settings, action, start, end), daemon=True)
         WORKER.start()
@@ -328,6 +490,7 @@ class Admin(BaseHTTPRequestHandler):
         return False
 
     def page(self, notice="", fields=None):
+        nonce = secrets.token_urlsafe(18)
         settings = config()
         fields = fields or {}
         value = lambda key, default="": html.escape(fields.get(key, default), quote=True)
@@ -335,12 +498,18 @@ class Admin(BaseHTTPRequestHandler):
             events = conn.execute("SELECT at, detail FROM events ORDER BY id DESC LIMIT 100").fetchall()
         entries = "".join(f"<li><time>{at} UTC</time> {html.escape(detail)}</li>" for at, detail in events)
         mode = fields.get("mode", settings.get("mode", "copy"))
+        backend = fields.get("backend", settings.get("backend", "bot"))
         remove_caption = fields.get("remove_caption") == "on" if fields else settings.get("remove_caption", False)
         body = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
         <meta name="viewport" content="width=device-width,initial-scale=1"><title>频道媒体组转发</title>
         <style>
         *{{box-sizing:border-box}}body{{margin:0;background:#f0f4f7;color:#12273b;font:15px Inter,system-ui,sans-serif}}
-        header{{background:#142d44;color:#fff;padding:22px max(20px,calc((100vw - 1040px)/2))}}
+        .layout{{display:grid;grid-template-columns:210px minmax(0,1fr);min-height:100vh}}
+        aside{{background:#142d44;color:#fff;padding:24px 16px}}
+        aside strong{{display:block;margin:0 8px 20px;font-size:18px}}
+        aside a{{display:block;color:#e4efff;padding:10px 12px;text-decoration:none;border-radius:8px}}
+        aside a:hover{{background:#254866}}
+        header{{padding:24px 24px 0;max-width:1080px;margin:auto}}
         h1{{margin:0 0 7px;font-size:26px}}h2{{font-size:18px;margin:0 0 12px}}
         main{{max-width:1080px;margin:auto;padding:24px;display:grid;grid-template-columns:1.1fr 1fr;gap:18px}}
         section{{background:white;border:1px solid #dce6ef;border-radius:14px;padding:20px;min-width:0}}
@@ -350,12 +519,21 @@ class Admin(BaseHTTPRequestHandler):
         .secondary{{background:#e6eef6;color:#193d61}}ol{{padding-left:22px;max-height:580px;overflow:auto}}
         li{{padding:9px 0;border-bottom:1px solid #e5edf3;overflow-wrap:anywhere}}time{{color:#52667b;display:block;font-size:12px}}
         .notice{{grid-column:1/-1;margin:0;padding:10px;background:#dcecff;border-radius:7px}}
-        @media(max-width:760px){{main{{grid-template-columns:1fr}}}}
-        </style><header><h1>频道媒体组转发</h1>{html.escape(STATE['status'])} · {html.escape(STATE['identity'] or '未验证 Bot')}</header>
+        progress{{width:100%;height:12px}} #progress-label{{color:#304961}}
+        @media(max-width:920px){{main{{grid-template-columns:1fr}}}}
+        @media(max-width:640px){{.layout{{display:block}}aside nav{{display:flex;flex-wrap:wrap}}}}
+        </style><div class="layout"><aside><strong>媒体组转发</strong><nav>
+        <a href="#settings">转发设置</a><a href="#history">历史迁移</a><a href="#runtime">运行进度与日志</a>
+        </nav></aside><div><header><h1>频道媒体组转发</h1><span id="status">{html.escape(STATE['status'])}</span>
+        · <span id="identity">{html.escape(STATE['identity'] or '未验证')}</span></header>
         <main>{f'<p class="notice" role="status">{html.escape(notice)}</p>' if notice else ''}
-        <section><h2>转发设置</h2><form method="post" action="/">
+        <section id="settings"><h2>转发设置</h2><form method="post" action="/">
         <input type="hidden" name="csrf" value="{CSRF}">
-        <label>Bot Token<input name="token" type="password" autocomplete="new-password" placeholder="留空保留已保存的 Token"></label>
+        <label>连接方式<select name="backend" id="backend">
+        <option value="bot" {'selected' if backend=='bot' else ''}>Bot API</option>
+        <option value="account" {'selected' if backend=='account' else ''}>Telegram 账号 API</option></select></label>
+        <label id="token-field">Bot Token<input name="token" type="password" autocomplete="new-password" placeholder="留空保留已保存的 Token"></label>
+        <p id="account-hint">首次使用请在服务器终端登录 Telegram 账号，命令见部署说明。</p>
         <label>来源频道<input name="source" value="{value('source', settings.get('source',''))}" placeholder="@source 或 -100…"></label>
         <label>目标频道<input name="targets" value="{value('targets', ', '.join(settings.get('targets', [])))}" placeholder="多个频道用逗号分隔"></label>
         <label>实时转发方式<select name="mode"><option value="copy" {'selected' if mode=='copy' else ''}>无引用复制</option>
@@ -364,17 +542,59 @@ class Admin(BaseHTTPRequestHandler):
         <div class="actions"><button name="action" value="save" class="secondary">保存配置</button>
         <button name="action" value="test" class="secondary">测试连接</button>
         <button name="action" value="live">开始实时转发</button><button name="action" value="stop" class="secondary">停止任务</button></div>
-        <h2 style="margin-top:24px">历史迁移</h2><div class="row">
+        <h2 id="history" style="margin-top:24px">历史迁移</h2><div class="row">
         <label>起始消息 ID<input name="start" inputmode="numeric" value="{value('start')}"></label>
         <label>结束消息 ID<input name="end" inputmode="numeric" value="{value('end')}" placeholder="留空自动扫描"></label></div>
         <button name="action" value="history">开始历史复制</button></form></section>
-        <section><h2>运行日志</h2><a href="/">刷新状态</a><ol>{entries or '<li>暂无运行记录</li>'}</ol></section>
-        </main></html>""".encode()
+        <section id="runtime"><h2>运行进度与日志</h2>
+        <p id="progress-label" role="status">已处理 0 条 · 已发送 0 条</p>
+        <progress id="progress" aria-label="历史扫描进度" hidden></progress>
+        <ol id="logs">{entries or '<li>暂无运行记录</li>'}</ol></section>
+        </main></div></div><script nonce="{nonce}">
+        const get = id => document.getElementById(id);
+        function modeFields() {{
+            const account = get("backend").value === "account";
+            get("token-field").hidden = account;
+            get("account-hint").hidden = !account;
+        }}
+        get("backend").addEventListener("change", modeFields);
+        modeFields();
+        let newest = null;
+        async function refresh() {{
+            try {{
+                const response = await fetch("/status", {{cache:"no-store"}});
+                if (!response.ok) return;
+                const data = await response.json();
+                get("status").textContent = data.status;
+                get("identity").textContent = data.identity || "未验证";
+                const total = data.total ? "/" + data.total : "";
+                get("progress-label").textContent = "已处理 " + data.processed + total + " 条 · 已发送 " + data.sent + " 条";
+                const bar = get("progress");
+                bar.hidden = !data.total;
+                if (data.total) {{ bar.max = data.total; bar.value = data.processed; }}
+                const head = data.logs[0]?.[0];
+                if (head === newest || head === undefined) return;
+                newest = head;
+                get("logs").replaceChildren(...data.logs.map(([, at, detail]) => {{
+                    const item = document.createElement("li");
+                    const time = document.createElement("time");
+                    time.textContent = at + " UTC";
+                    item.append(time, detail);
+                    return item;
+                }}));
+            }} catch {{
+                get("status").textContent = "无法刷新状态，正在重试";
+            }} finally {{
+                setTimeout(refresh, 1500);
+            }}
+        }}
+        refresh();
+        </script></html>""".encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; connect-src 'self'; frame-ancestors 'none'; form-action 'self'")
         self.end_headers()
         self.wfile.write(body)
 
@@ -382,6 +602,16 @@ class Admin(BaseHTTPRequestHandler):
         if self.authorized():
             if self.path == "/":
                 self.page()
+            elif self.path == "/status":
+                with database() as conn:
+                    logs = conn.execute("SELECT id, at, detail FROM events ORDER BY id DESC LIMIT 100").fetchall()
+                body = json.dumps({**STATE, **PROGRESS, "logs": logs}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             else:
                 self.send_error(404)
 
@@ -416,6 +646,9 @@ class Admin(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     os.umask(0o077)
+    if sys.argv[1:] == ["--login"]:
+        account_login()
+        sys.exit(0)
     init()
     credentials = f"{os.environ['ADMIN_USERNAME']}:{os.environ['ADMIN_PASSWORD']}"
     server = ThreadingHTTPServer((os.getenv("BIND_HOST", "127.0.0.1"), int(os.getenv("PORT", "8766"))), Admin)
