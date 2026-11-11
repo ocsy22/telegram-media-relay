@@ -1,0 +1,428 @@
+import base64
+import hmac
+import html
+import json
+import os
+import re
+import secrets
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs
+from urllib.request import Request, urlopen
+
+DB = os.getenv("DB_PATH", "relay.sqlite3")
+CSRF = secrets.token_urlsafe(32)
+TOKEN = re.compile(r"[1-9][0-9]{4,15}:[A-Za-z0-9_-]{20,100}")
+CHAT = re.compile(r"(?:-100[0-9]{5,13}|@[A-Za-z0-9_]{5,32})")
+STATE = {"status": "已停止", "identity": ""}
+LOCK = threading.Lock()
+STOP = threading.Event()
+WORKER = None
+
+
+@contextmanager
+def database():
+    conn = sqlite3.connect(DB)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def init():
+    with database() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT);
+            CREATE TABLE IF NOT EXISTS cursors (bot INTEGER PRIMARY KEY, offset INTEGER);
+            CREATE TABLE IF NOT EXISTS pending (
+                bot INTEGER, source INTEGER, album TEXT, message INTEGER, ready REAL,
+                PRIMARY KEY (bot, source, message)
+            );
+            CREATE TABLE IF NOT EXISTS delivered (
+                bot INTEGER, source INTEGER, album TEXT, target INTEGER,
+                PRIMARY KEY (bot, source, album, target)
+            );
+            CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, at TEXT, detail TEXT);
+        """)
+
+
+def log(detail):
+    with database() as conn:
+        conn.execute("INSERT INTO events(at, detail) VALUES(datetime('now'), ?)", (detail,))
+        conn.execute("DELETE FROM events WHERE id <= (SELECT max(id)-300 FROM events)")
+
+
+def config():
+    with database() as conn:
+        row = conn.execute("SELECT data FROM config WHERE id=1").fetchone()
+    return json.loads(row[0]) if row else {}
+
+
+class TelegramError(Exception):
+    def __init__(self, method, code=0, delay=0):
+        super().__init__(f"{method} · {'HTTP ' + str(code) if code else '连接失败'}")
+        self.code = code
+        self.delay = delay
+
+
+def api(token, method, **params):
+    req = Request(f"https://api.telegram.org/bot{token}/{method}",
+                  data=json.dumps(params).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=18 if method == "getUpdates" else 12) as response:
+            data = json.load(response)
+        if data.get("ok"):
+            return data["result"]
+    except HTTPError as exc:
+        delay = 0
+        if exc.code == 429:
+            try:
+                delay = int(json.load(exc).get("parameters", {}).get("retry_after", 5))
+            except (ValueError, OSError, TypeError):
+                delay = 5
+        raise TelegramError(method, exc.code, delay) from None
+    except (URLError, OSError, ValueError):
+        raise TelegramError(method) from None
+    raise TelegramError(method)
+
+
+def inspect(settings, verify_webhook=False):
+    token = settings["token"]
+    identity = api(token, "getMe")
+    if verify_webhook and api(token, "getWebhookInfo").get("url"):
+        raise ValueError("该 Bot 正在使用 Webhook，请先停止原有服务。")
+    source = api(token, "getChat", chat_id=settings["source"])
+    if source["type"] != "channel":
+        raise ValueError("来源必须是频道。")
+    membership = api(token, "getChatMember", chat_id=source["id"], user_id=identity["id"])
+    if membership["status"] not in {"administrator", "creator", "member"}:
+        raise ValueError("请先把 Bot 加入来源频道。")
+    targets = []
+    for name in settings["targets"]:
+        target = api(token, "getChat", chat_id=name)
+        if target["type"] != "channel" or target["id"] == source["id"]:
+            raise ValueError("目标必须是其他频道。")
+        membership = api(token, "getChatMember", chat_id=target["id"], user_id=identity["id"])
+        if membership["status"] != "creator" and not (
+            membership["status"] == "administrator" and membership.get("can_post_messages")
+        ):
+            raise ValueError(f"目标频道 {name} 未授予 Bot 发帖权限。")
+        if target["id"] not in targets:
+            targets.append(target["id"])
+    return identity, source["id"], targets
+
+
+def send(settings, source, target, ids):
+    method = "forwardMessages" if settings["mode"] == "forward" else "copyMessages"
+    options = {"remove_caption": True} if method == "copyMessages" and settings.get("remove_caption") else {}
+    while not STOP.is_set():
+        try:
+            return len(api(settings["token"], method, from_chat_id=source, chat_id=target,
+                           message_ids=ids, **options))
+        except TelegramError as exc:
+            if exc.code != 429:
+                raise
+            log(f"目标 {target} 触发限流，等待 {exc.delay or 5} 秒")
+            STOP.wait(max(1, exc.delay or 5))
+    return None
+
+
+def ingest(bot, source, updates):
+    now = time.time()
+    with database() as conn:
+        for update in updates:
+            post = update.get("channel_post")
+            if post and post["chat"]["id"] == source:
+                message = post["message_id"]
+                album = str(post.get("media_group_id") or f"single:{message}")
+                ready = now + 2.5 if post.get("media_group_id") else now
+                conn.execute("UPDATE pending SET ready=? WHERE bot=? AND source=? AND album=?",
+                             (ready, bot, source, album))
+                conn.execute("INSERT OR IGNORE INTO pending VALUES (?, ?, ?, ?, ?)",
+                             (bot, source, album, message, ready))
+        if updates:
+            conn.execute("INSERT OR REPLACE INTO cursors VALUES (?, ?)",
+                         (bot, updates[-1]["update_id"] + 1))
+
+
+def flush(settings, bot, source, targets):
+    with database() as conn:
+        batches = conn.execute("""
+            SELECT album FROM pending WHERE bot=? AND source=?
+            GROUP BY album HAVING max(ready)<=? ORDER BY min(message) LIMIT 30
+        """, (bot, source, time.time())).fetchall()
+    for (album,) in batches:
+        failed = False
+        with database() as conn:
+            ids = [row[0] for row in conn.execute(
+                "SELECT message FROM pending WHERE bot=? AND source=? AND album=? ORDER BY message",
+                (bot, source, album))]
+            done = {row[0] for row in conn.execute(
+                "SELECT target FROM delivered WHERE bot=? AND source=? AND album=?",
+                (bot, source, album))}
+        for target in targets:
+            if STOP.is_set():
+                return
+            if target in done:
+                continue
+            try:
+                count = send(settings, source, target, ids)
+            except TelegramError as exc:
+                log(f"目标 {target} 转发失败，待重试 · {exc}")
+                failed = True
+                continue
+            if count is None:
+                return
+            with database() as conn:
+                conn.execute("INSERT OR IGNORE INTO delivered VALUES (?, ?, ?, ?)",
+                             (bot, source, album, target))
+            log(f"目标 {target} 已发送 {count}/{len(ids)} 条")
+        if failed:
+            with database() as conn:
+                conn.execute("UPDATE pending SET ready=? WHERE bot=? AND source=? AND album=?",
+                             (time.time() + 30, bot, source, album))
+            continue
+        with database() as conn:
+            conn.execute("DELETE FROM pending WHERE bot=? AND source=? AND album=?", (bot, source, album))
+            conn.execute("DELETE FROM delivered WHERE bot=? AND source=? AND album=?", (bot, source, album))
+
+
+def live(settings, bot, source, targets):
+    last_error = ""
+    while not STOP.is_set():
+        flush(settings, bot, source, targets)
+        with database() as conn:
+            cursor = conn.execute("SELECT offset FROM cursors WHERE bot=?", (bot,)).fetchone()
+            waiting = conn.execute("SELECT 1 FROM pending WHERE bot=? AND source=? LIMIT 1",
+                                   (bot, source)).fetchone()
+        try:
+            updates = api(settings["token"], "getUpdates", offset=cursor[0] if cursor else 0,
+                          timeout=1 if waiting else 10, allowed_updates=["channel_post"])
+            ingest(bot, source, updates)
+            if last_error:
+                log("Telegram 轮询已恢复")
+            last_error = ""
+            STATE["status"] = "实时转发中"
+        except TelegramError as exc:
+            STATE["status"] = f"轮询重试 · {exc}"
+            if str(exc) != last_error:
+                log(STATE["status"])
+                last_error = str(exc)
+            STOP.wait(max(5, exc.delay))
+
+
+def migrate(settings, source, targets, start, end):
+    settings = {**settings, "mode": "copy"}
+    copied = 0
+    empty = 0
+    for first in range(start, (end or 2147483647) + 1, 100):
+        last = min(first + 99, end or 2147483647)
+        ids = list(range(first, last + 1))
+        delivered = 0
+        for target in targets:
+            count = send(settings, source, target, ids)
+            if count is None:
+                return
+            delivered += count
+            log(f"历史 {first}–{last} → {target} · 复制 {count} 条，跳过 {len(ids)-count} 条")
+        copied += delivered
+        STATE["status"] = f"历史迁移已扫描至 {last} · 共复制 {copied} 条"
+        empty = 0 if delivered else empty + 1
+        if end is None and empty >= 3:
+            log("连续 300 个 ID 无可复制消息，已停止自动扫描。")
+            break
+    if not STOP.is_set():
+        log(f"历史迁移完成 · 共复制 {copied} 条")
+
+
+def run(settings, action, start, end):
+    try:
+        identity, source, targets = inspect(settings, action == "live")
+        STATE["identity"] = "@" + identity["username"]
+        if action == "live":
+            log("实时转发已启动")
+            live(settings, identity["id"], source, targets)
+        else:
+            log(f"历史迁移已启动 · 从 {start} 开始")
+            migrate(settings, source, targets, start, end)
+        STATE["status"] = "已停止" if STOP.is_set() else "已完成"
+    except (TelegramError, ValueError) as exc:
+        STATE["status"] = "任务失败"
+        log(str(exc))
+    except Exception:
+        STATE["status"] = "任务失败"
+        log("内部错误，请检查服务状态和数据库权限。")
+
+
+def fields_to_settings(fields):
+    token = fields.get("token", "").strip() or config().get("token", "")
+    source = fields.get("source", "").strip()
+    targets = list(dict.fromkeys(re.split(r"[,，\s]+", fields.get("targets", "").strip())))
+    mode = fields.get("mode", "")
+    if not TOKEN.fullmatch(token):
+        raise ValueError("请填写有效的 Bot Token。")
+    if not CHAT.fullmatch(source) or not 1 <= len(targets) <= 20 or any(not CHAT.fullmatch(x) for x in targets):
+        raise ValueError("请填写频道 @用户名或 -100 开头的数字 ID，最多 20 个目标。")
+    if mode not in {"copy", "forward"}:
+        raise ValueError("请选择转发方式。")
+    return {"token": token, "source": source, "targets": targets, "mode": mode,
+            "remove_caption": fields.get("remove_caption") == "on"}
+
+
+def control(fields):
+    global WORKER
+    action = fields.get("action")
+    with LOCK:
+        if action == "stop":
+            STOP.set()
+            with database() as conn:
+                conn.execute("UPDATE config SET data=json_set(data, '$.auto_live', 0) WHERE id=1")
+            if WORKER and WORKER.is_alive():
+                STATE["status"] = "正在停止"
+            return "已提交停止请求。"
+        if WORKER and WORKER.is_alive():
+            raise ValueError("请先停止当前任务并等待退出。")
+        settings = fields_to_settings(fields)
+        if action == "test":
+            identity, _, targets = inspect(settings)
+            STATE["identity"] = "@" + identity["username"]
+            return f"连接验证通过 · {STATE['identity']} · {len(targets)} 个目标频道"
+        if action not in {"save", "live", "history"}:
+            raise ValueError("无法识别的操作。")
+        start = end = None
+        if action == "history":
+            raw_start = fields.get("start", "").strip()
+            raw_end = fields.get("end", "").strip()
+            if not re.fullmatch(r"[0-9]{1,10}", raw_start) or (
+                raw_end and not re.fullmatch(r"[0-9]{1,10}", raw_end)
+            ):
+                raise ValueError("请输入数字消息 ID。")
+            start = int(raw_start)
+            end = int(raw_end) if raw_end else None
+            if not 1 <= start <= 2147483647 or (end is not None and not start <= end <= 2147483647):
+                raise ValueError("请输入有效的起止消息 ID。")
+        settings["auto_live"] = action == "live"
+        with database() as conn:
+            conn.execute("INSERT OR REPLACE INTO config VALUES (1, ?)", (json.dumps(settings),))
+        if action == "save":
+            return "已保存配置。"
+        STOP.clear()
+        STATE["status"] = "正在检查频道权限"
+        WORKER = threading.Thread(target=run, args=(settings, action, start, end), daemon=True)
+        WORKER.start()
+        return "任务已提交。刷新可查看运行状态。"
+
+
+class Admin(BaseHTTPRequestHandler):
+    def authorized(self):
+        if hmac.compare_digest(self.headers.get("Authorization", "").encode(), self.server.auth):
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Telegram Media Relay"')
+        self.end_headers()
+        return False
+
+    def page(self, notice="", fields=None):
+        settings = config()
+        fields = fields or {}
+        value = lambda key, default="": html.escape(fields.get(key, default), quote=True)
+        with database() as conn:
+            events = conn.execute("SELECT at, detail FROM events ORDER BY id DESC LIMIT 100").fetchall()
+        entries = "".join(f"<li><time>{at} UTC</time> {html.escape(detail)}</li>" for at, detail in events)
+        mode = fields.get("mode", settings.get("mode", "copy"))
+        remove_caption = fields.get("remove_caption") == "on" if fields else settings.get("remove_caption", False)
+        body = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1"><title>频道媒体组转发</title>
+        <style>
+        *{{box-sizing:border-box}}body{{margin:0;background:#f0f4f7;color:#12273b;font:15px Inter,system-ui,sans-serif}}
+        header{{background:#142d44;color:#fff;padding:22px max(20px,calc((100vw - 1040px)/2))}}
+        h1{{margin:0 0 7px;font-size:26px}}h2{{font-size:18px;margin:0 0 12px}}
+        main{{max-width:1080px;margin:auto;padding:24px;display:grid;grid-template-columns:1.1fr 1fr;gap:18px}}
+        section{{background:white;border:1px solid #dce6ef;border-radius:14px;padding:20px;min-width:0}}
+        label{{display:block;margin:12px 0;color:#304961}}input:not([type=checkbox]),select{{width:100%;padding:10px;margin-top:5px;border:1px solid #a5b7c8;border-radius:7px;font:inherit}}
+        .row,.actions{{display:flex;gap:8px;flex-wrap:wrap}}.row label{{flex:1}}button,a{{font:inherit}}
+        button{{cursor:pointer;background:#155c9e;color:white;border:0;border-radius:7px;padding:8px 12px}}
+        .secondary{{background:#e6eef6;color:#193d61}}ol{{padding-left:22px;max-height:580px;overflow:auto}}
+        li{{padding:9px 0;border-bottom:1px solid #e5edf3;overflow-wrap:anywhere}}time{{color:#52667b;display:block;font-size:12px}}
+        .notice{{grid-column:1/-1;margin:0;padding:10px;background:#dcecff;border-radius:7px}}
+        @media(max-width:760px){{main{{grid-template-columns:1fr}}}}
+        </style><header><h1>频道媒体组转发</h1>{html.escape(STATE['status'])} · {html.escape(STATE['identity'] or '未验证 Bot')}</header>
+        <main>{f'<p class="notice" role="status">{html.escape(notice)}</p>' if notice else ''}
+        <section><h2>转发设置</h2><form method="post" action="/">
+        <input type="hidden" name="csrf" value="{CSRF}">
+        <label>Bot Token<input name="token" type="password" autocomplete="new-password" placeholder="留空保留已保存的 Token"></label>
+        <label>来源频道<input name="source" value="{value('source', settings.get('source',''))}" placeholder="@source 或 -100…"></label>
+        <label>目标频道<input name="targets" value="{value('targets', ', '.join(settings.get('targets', [])))}" placeholder="多个频道用逗号分隔"></label>
+        <label>实时转发方式<select name="mode"><option value="copy" {'selected' if mode=='copy' else ''}>无引用复制</option>
+        <option value="forward" {'selected' if mode=='forward' else ''}>带引用转发</option></select></label>
+        <label><input type="checkbox" name="remove_caption" {'checked' if remove_caption else ''}> 复制时清除媒体说明</label>
+        <div class="actions"><button name="action" value="save" class="secondary">保存配置</button>
+        <button name="action" value="test" class="secondary">测试连接</button>
+        <button name="action" value="live">开始实时转发</button><button name="action" value="stop" class="secondary">停止任务</button></div>
+        <h2 style="margin-top:24px">历史迁移</h2><div class="row">
+        <label>起始消息 ID<input name="start" inputmode="numeric" value="{value('start')}"></label>
+        <label>结束消息 ID<input name="end" inputmode="numeric" value="{value('end')}" placeholder="留空自动扫描"></label></div>
+        <button name="action" value="history">开始历史复制</button></form></section>
+        <section><h2>运行日志</h2><a href="/">刷新状态</a><ol>{entries or '<li>暂无运行记录</li>'}</ol></section>
+        </main></html>""".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; form-action 'self'")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.authorized():
+            if self.path == "/":
+                self.page()
+            else:
+                self.send_error(404)
+
+    def do_POST(self):
+        if not self.authorized():
+            return
+        if self.path != "/":
+            self.send_error(404)
+            return
+        try:
+            size = int(self.headers.get("Content-Length", 0))
+            if not 0 < size <= 8192:
+                raise ValueError()
+            fields = {key: values[0] for key, values in parse_qs(
+                self.rfile.read(size).decode(), max_num_fields=10, keep_blank_values=True).items()}
+        except ValueError:
+            self.send_error(400)
+            return
+        if not hmac.compare_digest(fields.get("csrf", "").encode(), CSRF.encode()):
+            self.send_error(403)
+            return
+        try:
+            notice = control(fields)
+        except (ValueError, TelegramError) as exc:
+            notice = str(exc)
+        self.page(notice, fields)
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    init()
+    credentials = f"{os.environ['ADMIN_USERNAME']}:{os.environ['ADMIN_PASSWORD']}"
+    server = ThreadingHTTPServer((os.getenv("BIND_HOST", "127.0.0.1"), int(os.getenv("PORT", "8766"))), Admin)
+    server.auth = b"Basic " + base64.b64encode(credentials.encode())
+    saved = config()
+    if saved.get("auto_live"):
+        STATE["status"] = "正在恢复实时转发"
+        WORKER = threading.Thread(target=run, args=(saved, "live", None, None), daemon=True)
+        WORKER.start()
+    server.serve_forever()
