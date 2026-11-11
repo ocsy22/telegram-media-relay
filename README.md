@@ -22,17 +22,15 @@ setup=$(mktemp) && wget -O "$setup" https://raw.githubusercontent.com/ocsy22/tel
 4. 历史迁移先停止实时任务，再填写起止消息 ID。历史使用无引用复制，建议选在相册边界外的完整区间。省略结束 ID 时，连续 300 个 ID 没有可复制消息即停止，因此遇到大段删除时请填明确的结束 ID。手动重新运行历史任务会再次复制所选范围。
 5. 刷新网页查看日志。不可复制的消息由 Telegram 跳过。服务日志可用 `journalctl -u telegram-media-relay -f` 查看。
 
-## Telegram 账号 API
+## 账号管理
 
-在 [Telegram API 管理页面](https://my.telegram.org/apps) 获取 API ID 和 API Hash。首次使用时，在 VPS 的 root 终端运行：
+侧栏「账号管理」可保存多组 Bot 和 Telegram 账号。添加 Bot 时填写备注和 Token，后台验证后保存。添加个人账号时先在 [Telegram API 管理页面](https://my.telegram.org/apps) 获取 API ID 和 API Hash，再在后台填写备注、API ID、API Hash 和带国家区号的手机号。提交验证码，有需要时再提交两步验证密码。
 
-```bash
-/opt/telegram-media-relay/venv/bin/python /opt/telegram-media-relay/app.py --login && systemctl restart telegram-media-relay.service
-```
+登录后回到「转发设置」，从「使用账号或 Bot」中选择已保存的连接，填写源频道和目标频道，再启动任务。升级时，原有 Bot 会自动出现在列表，已有终端账号也可继续选择。
 
-按提示输入 API ID、API Hash、手机号、登录验证码和两步验证密码（如果已启用）。登录后，回到后台把连接方式切换为「Telegram 账号 API」，填写账号可访问的源频道和具有发帖权限的目标频道，然后测试连接。账号模式使用同一套频道设置和任务按钮。历史迁移会读取实际存在的消息，并按相册分组。实时监听需要账号已加入源频道。
+请通过 HTTPS 或 SSH 隧道填写登录凭据。使用 SSH 时，在管理电脑运行 `ssh -N -L 8766:127.0.0.1:8766 root@VPS地址` 后打开 `http://127.0.0.1:8766/accounts`。网页登录的会话保存在服务的 SQLite 数据库中。
 
-进度与日志每 1.5 秒更新。有结束 ID 时显示区间扫描进度。实时或开放区间任务显示已处理数与各目标累计发送数。账号会话保存在仅 root 可读的 `/etc/telegram-media-relay/telegram-account.json`。备份时请妥善保管该文件。
+进度与日志每 1.5 秒更新。有结束 ID 时显示区间扫描进度。实时或开放区间任务显示已处理数与各目标累计发送数。
 
 Bot API 不提供按频道读取完整历史的接口。历史功能向 Telegram 提交指定 ID 范围，不会绕过受保护内容的限制。实时任务会保存已接收的更新和各目标进度。若进程恰好在 Telegram 成功处理请求后、写入本地进度前退出，重启后可能重复发送该批次。
 

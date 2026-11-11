@@ -27,6 +27,8 @@ PROGRESS = {"processed": 0, "total": None, "sent": 0}
 LOCK = threading.Lock()
 STOP = threading.Event()
 WORKER = None
+LOGIN_LOCK = threading.Lock()
+LOGIN_FLOW = None
 
 
 @contextmanager
@@ -53,7 +55,22 @@ def init():
                 PRIMARY KEY (bot, source, album, target)
             );
             CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, at TEXT, detail TEXT);
+            CREATE TABLE IF NOT EXISTS profiles (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, backend TEXT NOT NULL, credential TEXT NOT NULL
+            );
         """)
+        row = conn.execute("SELECT data FROM config WHERE id=1").fetchone()
+        if row:
+            saved = json.loads(row[0])
+            if "profile" not in saved:
+                token = saved.pop("token", "")
+                if token and TOKEN.fullmatch(token):
+                    cursor = conn.execute("INSERT INTO profiles(name, backend, credential) VALUES (?, 'bot', ?)",
+                                          ("原有 Bot", token))
+                    if saved.get("backend") != "account":
+                        saved["profile"] = str(cursor.lastrowid)
+                saved.setdefault("profile", "legacy" if saved.get("backend") == "account" else "")
+                conn.execute("UPDATE config SET data=? WHERE id=1", (json.dumps(saved),))
 
 
 def log(detail):
@@ -98,7 +115,7 @@ async def account_run(settings, action, start, end):
     from telethon.sessions import StringSession
     from telethon.tl.types import Channel
 
-    credential = account_file().read_text()
+    credential = settings.get("account") or account_file().read_text()
     if not credential:
         raise ValueError("账号尚未登录，请按部署说明在服务器终端登录。")
     account = json.loads(credential)
@@ -411,22 +428,122 @@ def run(settings, action, start, end):
         log(f"任务异常 · {type(exc).__name__}")
 
 
+def profile_choices():
+    with database() as conn:
+        return conn.execute("SELECT id, name, backend FROM profiles ORDER BY id").fetchall()
+
+
+def add_profile(name, backend, credential):
+    with database() as conn:
+        conn.execute("INSERT INTO profiles(name, backend, credential) VALUES (?, ?, ?)",
+                     (name, backend, credential))
+
+
+async def telegram_login(action, fields):
+    from telethon import TelegramClient, errors
+    from telethon.sessions import StringSession
+
+    global LOGIN_FLOW
+    if action == "request":
+        name = fields.get("name", "").strip()
+        raw_id = fields.get("api_id", "").strip()
+        api_hash = fields.get("api_hash", "").strip()
+        phone = fields.get("phone", "").strip()
+        if not 1 <= len(name) <= 64 or not re.fullmatch(r"[1-9][0-9]{0,9}", raw_id) or int(raw_id) > 2147483647:
+            raise ValueError("请填写备注和有效的 API ID。")
+        if not re.fullmatch(r"[a-fA-F0-9]{32}", api_hash) or not re.fullmatch(r"\+[1-9][0-9]{5,14}", phone):
+            raise ValueError("请填写有效的 API Hash 和带国家区号的手机号。")
+        flow = {"name": name, "id": int(raw_id), "hash": api_hash, "phone": phone,
+                "session": "", "expires": time.monotonic() + 300}
+    else:
+        flow = LOGIN_FLOW
+        if not flow or flow["expires"] < time.monotonic():
+            LOGIN_FLOW = None
+            raise ValueError("登录请求已过期，请重新发送验证码。")
+        if action != flow["step"]:
+            raise ValueError("请完成当前登录步骤。")
+    client = TelegramClient(StringSession(flow["session"]), flow["id"], flow["hash"],
+                            timeout=8, connection_retries=0, request_retries=0, flood_sleep_threshold=0)
+    try:
+        await client.connect()
+        if action == "request":
+            code = await client.send_code_request(flow["phone"])
+            flow.update(code_hash=code.phone_code_hash, session=client.session.save(), step="verify")
+            LOGIN_FLOW = flow
+            return "已请求验证码，请查看 Telegram 登录消息。"
+        if action == "verify":
+            code = fields.get("code", "").strip()
+            if not re.fullmatch(r"[0-9]{4,10}", code):
+                raise ValueError("请输入数字验证码。")
+            try:
+                user = await client.sign_in(phone=flow["phone"], code=code, phone_code_hash=flow["code_hash"])
+            except errors.SessionPasswordNeededError:
+                flow.update(session=client.session.save(), step="password")
+                return "该账号启用了两步验证，请输入两步验证密码。"
+        else:
+            password = fields.get("password", "")
+            if not password:
+                raise ValueError("请输入两步验证密码。")
+            user = await client.sign_in(password=password)
+        if not user or user.bot:
+            raise ValueError("请使用 Telegram 个人账号。")
+        credential = json.dumps({"id": flow["id"], "hash": flow["hash"], "session": client.session.save()})
+        add_profile(flow["name"], "account", credential)
+        LOGIN_FLOW = None
+        return "账号已保存，可在转发设置中选择。"
+    finally:
+        await client.disconnect()
+
+
+def manage_profile(fields):
+    global LOGIN_FLOW
+    action = fields.get("action", "")
+    if action == "add_bot":
+        name = fields.get("name", "").strip()
+        token = fields.get("token", "").strip()
+        if not 1 <= len(name) <= 64 or not TOKEN.fullmatch(token):
+            raise ValueError("请填写备注和有效的 Bot Token。")
+        identity = api(token, "getMe")
+        add_profile(name, "bot", token)
+        return f"Bot @{identity['username']} 已保存。"
+    with LOGIN_LOCK:
+        if action == "cancel":
+            LOGIN_FLOW = None
+            return "已取消登录。"
+        if action not in {"request", "verify", "password"}:
+            raise ValueError("无法识别的操作。")
+        try:
+            return asyncio.run(telegram_login(action, fields))
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"Telegram 登录失败 · {type(exc).__name__}") from None
+
+
+def attach_profile(settings):
+    selected = settings.get("profile", "")
+    if selected == "legacy" and account_file().is_file() and account_file().stat().st_size:
+        return {**settings, "backend": "account"}
+    if not re.fullmatch(r"[1-9][0-9]{0,17}", selected):
+        raise ValueError("请先在账号管理添加账号或 Bot，再选择连接。")
+    with database() as conn:
+        row = conn.execute("SELECT backend, credential FROM profiles WHERE id=?", (int(selected),)).fetchone()
+    if not row:
+        raise ValueError("找不到所选连接。")
+    backend, credential = row
+    return {**settings, "backend": backend, ("token" if backend == "bot" else "account"): credential}
+
+
 def fields_to_settings(fields):
-    token = fields.get("token", "").strip() or config().get("token", "")
     source = fields.get("source", "").strip()
     targets = list(dict.fromkeys(re.split(r"[,，\s]+", fields.get("targets", "").strip())))
     mode = fields.get("mode", "")
-    backend = fields.get("backend", "bot")
-    if backend not in {"bot", "account"}:
-        raise ValueError("请选择连接方式。")
-    if backend == "bot" and not TOKEN.fullmatch(token):
-        raise ValueError("请填写有效的 Bot Token。")
     if not CHAT.fullmatch(source) or not 1 <= len(targets) <= 20 or any(not CHAT.fullmatch(x) for x in targets):
         raise ValueError("请填写频道 @用户名或 -100 开头的数字 ID，最多 20 个目标。")
     if mode not in {"copy", "forward"}:
         raise ValueError("请选择转发方式。")
-    return {"token": token, "source": source, "targets": targets, "mode": mode, "backend": backend,
-            "remove_caption": fields.get("remove_caption") == "on"}
+    return attach_profile({"profile": fields.get("profile", ""), "source": source, "targets": targets, "mode": mode,
+            "remove_caption": fields.get("remove_caption") == "on"})
 
 
 def control(fields):
@@ -469,7 +586,8 @@ def control(fields):
                 raise ValueError("请输入有效的起止消息 ID。")
         settings["auto_live"] = action == "live"
         with database() as conn:
-            conn.execute("INSERT OR REPLACE INTO config VALUES (1, ?)", (json.dumps(settings),))
+            saved = {key: value for key, value in settings.items() if key not in {"token", "account"}}
+            conn.execute("INSERT OR REPLACE INTO config VALUES (1, ?)", (json.dumps(saved),))
         if action == "save":
             return "已保存配置。"
         STOP.clear()
@@ -489,7 +607,7 @@ class Admin(BaseHTTPRequestHandler):
         self.end_headers()
         return False
 
-    def page(self, notice="", fields=None):
+    def page(self, notice="", fields=None, accounts=False):
         nonce = secrets.token_urlsafe(18)
         settings = config()
         fields = fields or {}
@@ -498,12 +616,34 @@ class Admin(BaseHTTPRequestHandler):
             events = conn.execute("SELECT at, detail FROM events ORDER BY id DESC LIMIT 100").fetchall()
         entries = "".join(f"<li><time>{at} UTC</time> {html.escape(detail)}</li>" for at, detail in events)
         mode = fields.get("mode", settings.get("mode", "copy"))
-        backend = fields.get("backend", settings.get("backend", "bot"))
+        selected = fields.get("profile", settings.get("profile", ""))
+        choices = [(str(i), name, backend) for i, name, backend in profile_choices()]
+        legacy = account_file()
+        if legacy.is_file() and legacy.stat().st_size:
+            choices.append(("legacy", "原有终端账号", "account"))
+        options = "".join(
+            f'<option value="{i}" {"selected" if i == selected else ""}>{html.escape(name)} · {"Bot" if backend == "bot" else "账号"}</option>'
+            for i, name, backend in choices
+        )
+        profile_list = "".join(
+            f'<li>{html.escape(name)} · {"Bot" if backend == "bot" else "Telegram 账号"}</li>'
+            for _, name, backend in choices
+        )
+        flow = LOGIN_FLOW
+        step = flow["step"] if flow and flow["expires"] > time.monotonic() else ""
+        login_form = {
+            "verify": '<label>Telegram 验证码<input name="code" inputmode="numeric" autocomplete="one-time-code" required></label><button name="action" value="verify">验证并保存</button>',
+            "password": '<label>两步验证密码<input type="password" name="password" autocomplete="new-password" required></label><button name="action" value="password">登录并保存</button>',
+        }.get(step, """<label>备注<input name="name" maxlength="64" required></label>
+        <label>API ID<input name="api_id" inputmode="numeric" required></label>
+        <label>API Hash<input name="api_hash" type="password" autocomplete="new-password" required></label>
+        <label>手机号<input name="phone" type="tel" placeholder="+852…" required></label>
+        <button name="action" value="request">发送验证码</button>""")
         remove_caption = fields.get("remove_caption") == "on" if fields else settings.get("remove_caption", False)
         body = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
         <meta name="viewport" content="width=device-width,initial-scale=1"><title>频道媒体组转发</title>
         <style>
-        *{{box-sizing:border-box}}body{{margin:0;background:#f0f4f7;color:#12273b;font:15px Inter,system-ui,sans-serif}}
+        *{{box-sizing:border-box}}[hidden]{{display:none!important}}body{{margin:0;background:#f0f4f7;color:#12273b;font:15px Inter,system-ui,sans-serif}}
         .layout{{display:grid;grid-template-columns:210px minmax(0,1fr);min-height:100vh}}
         aside{{background:#142d44;color:#fff;padding:24px 16px}}
         aside strong{{display:block;margin:0 8px 20px;font-size:18px}}
@@ -523,17 +663,14 @@ class Admin(BaseHTTPRequestHandler):
         @media(max-width:920px){{main{{grid-template-columns:1fr}}}}
         @media(max-width:640px){{.layout{{display:block}}aside nav{{display:flex;flex-wrap:wrap}}}}
         </style><div class="layout"><aside><strong>媒体组转发</strong><nav>
-        <a href="#settings">转发设置</a><a href="#history">历史迁移</a><a href="#runtime">运行进度与日志</a>
+        <a href="/#settings">转发设置</a><a href="/accounts">账号管理</a><a href="/#history">历史迁移</a><a href="/#runtime">运行进度与日志</a>
         </nav></aside><div><header><h1>频道媒体组转发</h1><span id="status">{html.escape(STATE['status'])}</span>
         · <span id="identity">{html.escape(STATE['identity'] or '未验证')}</span></header>
         <main>{f'<p class="notice" role="status">{html.escape(notice)}</p>' if notice else ''}
-        <section id="settings"><h2>转发设置</h2><form method="post" action="/">
+        <section id="settings" {'hidden' if accounts else ''}><h2>转发设置</h2><form method="post" action="/">
         <input type="hidden" name="csrf" value="{CSRF}">
-        <label>连接方式<select name="backend" id="backend">
-        <option value="bot" {'selected' if backend=='bot' else ''}>Bot API</option>
-        <option value="account" {'selected' if backend=='account' else ''}>Telegram 账号 API</option></select></label>
-        <label id="token-field">Bot Token<input name="token" type="password" autocomplete="new-password" placeholder="留空保留已保存的 Token"></label>
-        <p id="account-hint">首次使用请在服务器终端登录 Telegram 账号，命令见部署说明。</p>
+        <label>使用账号或 Bot<select name="profile"><option value="">请选择已配置的连接</option>{options}</select></label>
+        <a href="/accounts">添加账号或 Bot</a>
         <label>来源频道<input name="source" value="{value('source', settings.get('source',''))}" placeholder="@source 或 -100…"></label>
         <label>目标频道<input name="targets" value="{value('targets', ', '.join(settings.get('targets', [])))}" placeholder="多个频道用逗号分隔"></label>
         <label>实时转发方式<select name="mode"><option value="copy" {'selected' if mode=='copy' else ''}>无引用复制</option>
@@ -546,19 +683,22 @@ class Admin(BaseHTTPRequestHandler):
         <label>起始消息 ID<input name="start" inputmode="numeric" value="{value('start')}"></label>
         <label>结束消息 ID<input name="end" inputmode="numeric" value="{value('end')}" placeholder="留空自动扫描"></label></div>
         <button name="action" value="history">开始历史复制</button></form></section>
-        <section id="runtime"><h2>运行进度与日志</h2>
+        <section id="runtime" {'hidden' if accounts else ''}><h2>运行进度与日志</h2>
         <p id="progress-label" role="status">已处理 0 条 · 已发送 0 条</p>
         <progress id="progress" aria-label="历史扫描进度" hidden></progress>
         <ol id="logs">{entries or '<li>暂无运行记录</li>'}</ol></section>
+        <section {'hidden' if not accounts else ''}><h2>Telegram 账号登录</h2>
+        <p>使用 HTTPS 或 SSH 隧道访问此页后再输入登录凭据。</p>
+        <form method="post" action="/accounts"><input type="hidden" name="csrf" value="{CSRF}">
+        {login_form}<button class="secondary" name="action" value="cancel" formnovalidate>取消</button></form></section>
+        <section {'hidden' if not accounts else ''}><h2>添加 Bot</h2>
+        <form method="post" action="/accounts"><input type="hidden" name="csrf" value="{CSRF}">
+        <label>备注<input name="name" maxlength="64" required></label>
+        <label>Bot Token<input name="token" type="password" autocomplete="new-password" required></label>
+        <button name="action" value="add_bot">验证并保存</button></form>
+        <h2 style="margin-top:24px">已配置的连接</h2><ul>{profile_list or '<li>暂无</li>'}</ul></section>
         </main></div></div><script nonce="{nonce}">
         const get = id => document.getElementById(id);
-        function modeFields() {{
-            const account = get("backend").value === "account";
-            get("token-field").hidden = account;
-            get("account-hint").hidden = !account;
-        }}
-        get("backend").addEventListener("change", modeFields);
-        modeFields();
         let newest = null;
         async function refresh() {{
             try {{
@@ -602,6 +742,8 @@ class Admin(BaseHTTPRequestHandler):
         if self.authorized():
             if self.path == "/":
                 self.page()
+            elif self.path == "/accounts":
+                self.page(accounts=True)
             elif self.path == "/status":
                 with database() as conn:
                     logs = conn.execute("SELECT id, at, detail FROM events ORDER BY id DESC LIMIT 100").fetchall()
@@ -618,7 +760,7 @@ class Admin(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authorized():
             return
-        if self.path != "/":
+        if self.path not in {"/", "/accounts"}:
             self.send_error(404)
             return
         try:
@@ -634,10 +776,10 @@ class Admin(BaseHTTPRequestHandler):
             self.send_error(403)
             return
         try:
-            notice = control(fields)
+            notice = manage_profile(fields) if self.path == "/accounts" else control(fields)
         except (ValueError, TelegramError) as exc:
             notice = str(exc)
-        self.page(notice, fields)
+        self.page(notice, fields if self.path == "/" else None, accounts=self.path == "/accounts")
 
     def setup(self):
         super().setup()
@@ -655,7 +797,12 @@ if __name__ == "__main__":
     server.auth = b"Basic " + base64.b64encode(credentials.encode())
     saved = config()
     if saved.get("auto_live"):
-        STATE["status"] = "正在恢复实时转发"
-        WORKER = threading.Thread(target=run, args=(saved, "live", None, None), daemon=True)
-        WORKER.start()
+        try:
+            saved = attach_profile(saved)
+        except ValueError as exc:
+            STATE["status"] = str(exc)
+        else:
+            STATE["status"] = "正在恢复实时转发"
+            WORKER = threading.Thread(target=run, args=(saved, "live", None, None), daemon=True)
+            WORKER.start()
     server.serve_forever()
